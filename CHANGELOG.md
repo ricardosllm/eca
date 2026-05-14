@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Support including `AGENTS.md` files from parent directories of each workspace folder via new `includeParentAgentsFiles` config flag (disabled by default), ordered outermost parent first.
+- Add AWS Bedrock provider using the native `Converse`/`ConverseStream` APIs with bearer-token auth, supporting models not available on Bedrock's OpenAI-compatible endpoint (e.g. Claude inference profiles). #254
 
 ## 0.133.6
 
