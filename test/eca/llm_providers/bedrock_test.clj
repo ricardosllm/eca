@@ -274,7 +274,21 @@
          (collecting-callbacks events*)))
       (is (match? [[:msg {:type :text :text "partial"}]
                    [:error {:error/type :premature-stop}]]
-                  @events*)))))
+                  @events*))))
+
+  (testing "a modeled stream error frame surfaces one error and no premature-stop"
+    (let [events* (atom [])
+          frames (frames-stream
+                  (make-frame "messageStart" {:role "assistant"})
+                  (make-frame "throttlingException" {:message "slow down"}))]
+      (with-redefs [http/post (fn [_ _] {:status 200 :body frames})]
+        (llm-providers.bedrock/chat!
+         {:model "model-x" :api-url "http://localhost:1" :api-key "k"
+          :user-messages [{:role "user" :content "hi"}] :past-messages []}
+         (collecting-callbacks events*)))
+      (is (match? [[:error {:message #"throttlingException"}]]
+                  (filterv #(= :error (first %)) @events*))
+          "exactly one error event, no trailing premature-stop"))))
 
 ;; --- handle-stream branches ---
 
@@ -317,4 +331,10 @@
 
     (testing "an unknown/exception frame is surfaced as an error"
       (is (match? [[:error {:message #"Bedrock stream error"}]]
-                  (run! (atom {}) "throttlingException" {:message "slow down"}))))))
+                  (run! (atom {}) "throttlingException" {:message "slow down"}))))
+
+    (testing "returns true for terminal events (messageStop, error frames), false otherwise"
+      (is (true? (#'llm-providers.bedrock/handle-stream "messageStop" {:stopReason "end_turn"} (atom {}) ctx)))
+      (is (true? (#'llm-providers.bedrock/handle-stream "throttlingException" {:message "x"} (atom {}) ctx)))
+      (is (false? (boolean (#'llm-providers.bedrock/handle-stream
+                            "contentBlockDelta" {:contentBlockIndex 0 :delta {:text "x"}} (atom {}) ctx)))))))

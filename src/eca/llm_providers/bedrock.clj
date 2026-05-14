@@ -142,12 +142,13 @@
 ;; --- Request body ---
 
 (def ^:private allowed-extra-payload-keys
-  "Top-level members the Converse API accepts. extraPayload is filtered to
-   these so provider/model variant payloads aimed at other APIs (e.g.
-   Anthropic's `:thinking`) don't reach Bedrock and trigger a 400."
+  "Top-level members the Converse / ConverseStream APIs accept (minus
+   `:messages` and `:modelId`, which the handler owns). extraPayload is
+   filtered to these so provider/model variant payloads aimed at other APIs
+   (e.g. Anthropic's `:thinking`) don't reach Bedrock and trigger a 400."
   #{:additionalModelRequestFields :additionalModelResponseFieldPaths
-    :guardrailConfig :inferenceConfig :performanceConfig
-    :promptVariables :requestMetadata :system :toolConfig})
+    :guardrailConfig :inferenceConfig :outputConfig :performanceConfig
+    :promptVariables :requestMetadata :serviceTier :system :toolConfig})
 
 (defn ^:private build-body
   [{:keys [messages instructions max-output-tokens tools reason? extra-payload]}]
@@ -308,8 +309,10 @@
                     (set-reading-fn false)
                     (touch-fn)
                     (llm-util/log-response logger-tag rid event data)
-                    (on-stream event data content-block*)
-                    (when (= "messageStop" event)
+                    ;; on-stream reports whether the event terminates the
+                    ;; turn — messageStop, but also a modeled error frame,
+                    ;; which can end the stream without a messageStop.
+                    (when (on-stream event data content-block*)
                       (reset! completed?* true))
                     (set-reading-fn true)))
                 (when-not (or @completed?* (cancelled?))
@@ -350,9 +353,19 @@
 
 ;; --- Streaming event handler ---
 
+(def ^:private known-stream-events
+  #{"messageStart" "contentBlockStart" "contentBlockDelta" "contentBlockStop"
+    "messageStop" "metadata"})
+
 (defn ^:private handle-stream
   "Drives ECA callbacks from a single ConverseStream event. `ctx` carries the
-   callbacks plus what `reissue-after-tools!` needs to continue the tool loop."
+   callbacks plus what `reissue-after-tools!` needs to continue the tool loop.
+
+   Returns true when the event terminates the turn: `messageStop`, or an
+   unknown event — modeled error frames (validationException,
+   throttlingException, modelStreamErrorException) end the stream without a
+   messageStop, so they must count as completion to avoid a spurious
+   premature-stop error after the real one."
   [event data content-block*
    {:keys [on-message-received on-error on-reason on-prepare-tool-call
            on-tools-called on-usage-updated]
@@ -433,7 +446,9 @@
       (on-usage-updated (parse-usage usage)))
 
     ;; exception / error frames
-    (on-error {:message (format "Bedrock stream error (%s): %s" event data)})))
+    (on-error {:message (format "Bedrock stream error (%s): %s" event data)}))
+  (or (= "messageStop" event)
+      (not (contains? known-stream-events event))))
 
 ;; --- Entry point ---
 
