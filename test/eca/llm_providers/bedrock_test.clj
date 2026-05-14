@@ -4,6 +4,7 @@
    [clojure.test :refer [deftest is testing]]
    [eca.client-test-helpers :refer [with-client-proxied]]
    [eca.llm-providers.bedrock :as llm-providers.bedrock]
+   [hato.client :as http]
    [matcher-combinators.test :refer [match?]])
   (:import
    [java.io ByteArrayInputStream ByteArrayOutputStream]))
@@ -41,19 +42,40 @@
     (write-u32! baos 0) ;; message crc
     (.toByteArray baos)))
 
+(defn ^:private frames-stream [& frames]
+  (ByteArrayInputStream. (byte-array (mapcat seq frames))))
+
+;; --- decoder ---
+
 (deftest event-stream-seq-test
   (testing "decodes consecutive event-stream frames into [event-type data] pairs"
-    (let [frames (byte-array (concat (make-frame "messageStart" {:role "assistant"})
-                                     (make-frame "contentBlockDelta" {:contentBlockIndex 0
-                                                                      :delta {:text "hi"}})
-                                     (make-frame "messageStop" {:stopReason "end_turn"})))
-          events (vec (#'llm-providers.bedrock/event-stream-seq (ByteArrayInputStream. frames)))]
-      (is (= [["messageStart" {:role "assistant"}]
-              ["contentBlockDelta" {:contentBlockIndex 0 :delta {:text "hi"}}]
-              ["messageStop" {:stopReason "end_turn"}]]
-             events))))
+    (is (= [["messageStart" {:role "assistant"}]
+            ["contentBlockDelta" {:contentBlockIndex 0 :delta {:text "hi"}}]
+            ["messageStop" {:stopReason "end_turn"}]]
+           (vec (#'llm-providers.bedrock/event-stream-seq
+                 (frames-stream (make-frame "messageStart" {:role "assistant"})
+                                (make-frame "contentBlockDelta" {:contentBlockIndex 0 :delta {:text "hi"}})
+                                (make-frame "messageStop" {:stopReason "end_turn"})))))))
+
   (testing "returns empty seq on a clean EOF"
-    (is (= [] (vec (#'llm-providers.bedrock/event-stream-seq (ByteArrayInputStream. (byte-array 0))))))))
+    (is (= [] (vec (#'llm-providers.bedrock/event-stream-seq (ByteArrayInputStream. (byte-array 0)))))))
+
+  (testing "throws on a truncated frame"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Unexpected EOF"
+                          (vec (#'llm-providers.bedrock/event-stream-seq
+                                (ByteArrayInputStream. (byte-array 6)))))))
+
+  (testing "throws on a frame with negative payload length"
+    (let [baos (ByteArrayOutputStream.)]
+      (write-u32! baos 20) ;; total-len < headers-len + 16
+      (write-u32! baos 8)  ;; headers-len
+      (write-u32! baos 0)
+      (.write baos (byte-array 8))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"negative payload length"
+                            (vec (#'llm-providers.bedrock/event-stream-seq
+                                  (ByteArrayInputStream. (.toByteArray baos)))))))))
+
+;; --- normalization / body ---
 
 (deftest normalize-conversation-test
   (testing "string content becomes a single text block"
@@ -95,7 +117,9 @@
     (is (match? {:additionalModelRequestFields {:reasoning_config {:type "enabled"}}}
                 (#'llm-providers.bedrock/build-body {:messages [] :reason? true})))))
 
-(deftest converse-request-test
+;; --- chat! non-streaming ---
+
+(deftest chat!-non-streaming-test
   (testing "constructs a Converse request and parses the response"
     (let [req* (atom nil)]
       (with-client-proxied {}
@@ -126,3 +150,171 @@
           (is (match? {:output-text "Hello!"
                        :usage {:input-tokens 10 :output-tokens 3}}
                       result)))))))
+
+(deftest chat!-non-streaming-tool-loop-test
+  (testing "a toolUse response yields tools-to-call and call-tools-fn re-issues the request"
+    (let [call-count* (atom 0)]
+      (with-client-proxied {}
+        (fn handler [_]
+          (swap! call-count* inc)
+          {:status 200
+           :body (if (= 1 @call-count*)
+                   {:output {:message {:content [{:toolUse {:toolUseId "t1"
+                                                            :name "get_weather"
+                                                            :input {:city "Paris"}}}]}}
+                    :stopReason "tool_use"
+                    :usage {:inputTokens 5 :outputTokens 2}}
+                   {:output {:message {:content [{:text "It is sunny."}]}}
+                    :stopReason "end_turn"
+                    :usage {:inputTokens 8 :outputTokens 4}})})
+
+        (let [result (llm-providers.bedrock/chat!
+                      {:model "model-x" :api-url "http://localhost:1" :api-key "k"
+                       :user-messages [{:role "user" :content "weather?"}] :past-messages []}
+                      nil)]
+          (is (match? [{:id "t1" :full-name "get_weather" :arguments {:city "Paris"}}]
+                      (:tools-to-call result)))
+          (let [next-result ((:call-tools-fn result)
+                             (constantly {:new-messages [{:role "user" :content "weather?"}]
+                                          :tools nil}))]
+            (is (= 2 @call-count*))
+            (is (match? {:output-text "It is sunny."} next-result))))))))
+
+;; --- chat! streaming ---
+
+(defn ^:private collecting-callbacks [events*]
+  {:on-message-received #(swap! events* conj [:msg %])
+   :on-error #(swap! events* conj [:error %])
+   :on-reason #(swap! events* conj [:reason %])
+   :on-prepare-tool-call #(swap! events* conj [:prepare %])
+   :on-tools-called (constantly nil)
+   :on-usage-updated #(swap! events* conj [:usage %])})
+
+(deftest chat!-streaming-test
+  (testing "decodes a streamed response and drives text + finish + usage callbacks"
+    (let [events* (atom [])
+          frames (frames-stream
+                  (make-frame "messageStart" {:role "assistant"})
+                  (make-frame "contentBlockDelta" {:contentBlockIndex 0 :delta {:text "Hello!"}})
+                  (make-frame "messageStop" {:stopReason "end_turn"})
+                  (make-frame "metadata" {:usage {:inputTokens 7 :outputTokens 2}}))]
+      (with-redefs [http/post (fn [_ _] {:status 200 :body frames})]
+        (llm-providers.bedrock/chat!
+         {:model "model-x" :api-url "http://localhost:1" :api-key "k"
+          :user-messages [{:role "user" :content "hi"}] :past-messages []}
+         (collecting-callbacks events*)))
+      (is (= [[:msg {:type :text :text "Hello!"}]
+              [:msg {:type :finish :finish-reason "end_turn"}]
+              [:usage {:input-tokens 7 :output-tokens 2 :input-cache-read-tokens 0 :input-cache-creation-tokens 0}]]
+             @events*)))))
+
+(deftest chat!-streaming-tool-loop-test
+  (testing "a streamed tool_use turn re-issues the request with the updated history"
+    (let [events* (atom [])
+          call-count* (atom 0)
+          tool-frames (frames-stream
+                       (make-frame "messageStart" {:role "assistant"})
+                       (make-frame "contentBlockStart" {:contentBlockIndex 0
+                                                        :start {:toolUse {:toolUseId "t1" :name "get_weather"}}})
+                       (make-frame "contentBlockDelta" {:contentBlockIndex 0
+                                                        :delta {:toolUse {:input "{\"city\": \"Paris\"}"}}})
+                       (make-frame "contentBlockStop" {:contentBlockIndex 0})
+                       (make-frame "messageStop" {:stopReason "tool_use"}))
+          final-frames (frames-stream
+                        (make-frame "messageStart" {:role "assistant"})
+                        (make-frame "contentBlockDelta" {:contentBlockIndex 0 :delta {:text "done"}})
+                        (make-frame "messageStop" {:stopReason "end_turn"}))
+          callbacks (assoc (collecting-callbacks events*)
+                           :on-tools-called (fn [tool-calls]
+                                              (swap! events* conj [:tools tool-calls])
+                                              {:new-messages [{:role "user" :content "weather?"}]
+                                               :tools nil}))]
+      (with-redefs [http/post (fn [_ _]
+                                (swap! call-count* inc)
+                                {:status 200 :body (if (= 1 @call-count*) tool-frames final-frames)})]
+        (llm-providers.bedrock/chat!
+         {:model "model-x" :api-url "http://localhost:1" :api-key "k"
+          :user-messages [{:role "user" :content "weather?"}] :past-messages []}
+         callbacks))
+      (is (= 2 @call-count*))
+      (is (match? [[:prepare {:full-name "get_weather" :id "t1" :arguments-text ""}]
+                   [:prepare {:full-name "get_weather" :id "t1" :arguments-text "{\"city\": \"Paris\"}"}]
+                   [:tools [{:id "t1" :full-name "get_weather" :arguments {"city" "Paris"}}]]
+                   [:msg {:type :text :text "done"}]
+                   [:msg {:type :finish :finish-reason "end_turn"}]]
+                  @events*)))))
+
+(deftest chat!-error-paths-test
+  (testing "non-200 response is surfaced as an error result"
+    (with-client-proxied {}
+      (fn [_] {:status 400 :body {:message "ValidationException"}})
+      (let [result (llm-providers.bedrock/chat!
+                    {:model "model-x" :api-url "http://localhost:1" :api-key "k"
+                     :user-messages [{:role "user" :content "hi"}] :past-messages []}
+                    nil)]
+        (is (match? {:error {:status 400}} result)))))
+
+  (testing "a transport exception is surfaced as an error result"
+    (with-redefs [http/post (fn [_ _] (throw (java.io.IOException. "connection refused")))]
+      (let [result (llm-providers.bedrock/chat!
+                    {:model "model-x" :api-url "http://localhost:1" :api-key "k"
+                     :user-messages [{:role "user" :content "hi"}] :past-messages []}
+                    nil)]
+        (is (match? {:error {:exception some?}} result)))))
+
+  (testing "a stream that ends without messageStop reports a premature stop"
+    (let [events* (atom [])
+          frames (frames-stream
+                  (make-frame "messageStart" {:role "assistant"})
+                  (make-frame "contentBlockDelta" {:contentBlockIndex 0 :delta {:text "partial"}}))]
+      (with-redefs [http/post (fn [_ _] {:status 200 :body frames})]
+        (llm-providers.bedrock/chat!
+         {:model "model-x" :api-url "http://localhost:1" :api-key "k"
+          :user-messages [{:role "user" :content "hi"}] :past-messages []}
+         (collecting-callbacks events*)))
+      (is (match? [[:msg {:type :text :text "partial"}]
+                   [:error {:error/type :premature-stop}]]
+                  @events*)))))
+
+;; --- handle-stream branches ---
+
+(deftest handle-stream-test
+  (let [events* (atom [])
+        ctx {:on-message-received #(swap! events* conj [:msg %])
+             :on-error #(swap! events* conj [:error %])
+             :on-reason #(swap! events* conj [:reason %])
+             :on-prepare-tool-call #(swap! events* conj [:prepare %])
+             :on-usage-updated #(swap! events* conj [:usage %])
+             :on-tools-called (constantly nil)}
+        run! (fn [cb* event data]
+               (reset! events* [])
+               (#'llm-providers.bedrock/handle-stream event data cb* ctx)
+               @events*)]
+    (testing "text delta emits a message"
+      (is (= [[:msg {:type :text :text "hi"}]]
+             (run! (atom {}) "contentBlockDelta" {:contentBlockIndex 0 :delta {:text "hi"}}))))
+
+    (testing "reasoning deltas start, stream and finish a reason block"
+      (let [cb* (atom {})]
+        (is (match? [[:reason {:status :started}] [:reason {:status :thinking :text "thinking"}]]
+                    (run! cb* "contentBlockDelta" {:contentBlockIndex 0
+                                                   :delta {:reasoningContent {:text "thinking"}}}))
+            "second event matched after first started it")
+        (is (match? [[:reason {:status :thinking :text "thinking"}]]
+                    (run! cb* "contentBlockDelta" {:contentBlockIndex 0
+                                                   :delta {:reasoningContent {:text "thinking"}}})))
+        (is (match? [[:reason {:status :finished :external-id "sig"}]]
+                    (run! cb* "contentBlockDelta" {:contentBlockIndex 0
+                                                   :delta {:reasoningContent {:signature "sig"}}})))))
+
+    (testing "max_tokens stop reason emits limit-reached"
+      (is (= [[:msg {:type :limit-reached}]]
+             (run! (atom {}) "messageStop" {:stopReason "max_tokens"}))))
+
+    (testing "metadata emits usage"
+      (is (match? [[:usage {:input-tokens 3 :output-tokens 1}]]
+                  (run! (atom {}) "metadata" {:usage {:inputTokens 3 :outputTokens 1}}))))
+
+    (testing "an unknown/exception frame is surfaced as an error"
+      (is (match? [[:error {:message #"Bedrock stream error"}]]
+                  (run! (atom {}) "throttlingException" {:message "slow down"}))))))

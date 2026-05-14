@@ -23,19 +23,26 @@
 
 (def ^:private logger-tag "[BEDROCK]")
 
-(def ^:private default-max-output-tokens 32000)
+(def ^:private default-max-output-tokens
+  "Floor for `maxTokens` used only when the caller omits `:max-output-tokens`.
+   It is not a per-model limit — model-aware caps come from the caller."
+  32000)
+
 (def ^:private default-reasoning-budget-tokens 2048)
 
 ;; --- Message normalization (ECA <-> Bedrock Converse blocks) ---
 
 (defn ^:private image-format
-  "Maps an `image/*` media type to the format string Bedrock expects."
+  "Maps an `image/*` media type to the format string Bedrock expects.
+   Warns and falls back to `png` for unrecognized types."
   [media-type]
   (case media-type
+    "image/png" "png"
     "image/jpeg" "jpeg"
     "image/gif" "gif"
     "image/webp" "webp"
-    "png"))
+    (do (logger/warn logger-tag (format "Unknown image media type '%s', defaulting to png" media-type))
+        "png")))
 
 (defn ^:private ->image-block [{:keys [media-type base64]}]
   {:image {:format (image-format media-type)
@@ -57,7 +64,7 @@
    maps where content is always a vector of Converse content blocks."
   [messages supports-image?]
   (keep
-   (fn [{:keys [role content] :as msg}]
+   (fn [{:keys [role content]}]
      (case role
        "tool_call"
        {:role "assistant"
@@ -184,7 +191,8 @@
 (defn ^:private parse-headers
   "Parses event-stream frame headers. Only the string header type (7) is
    handled — every header Bedrock emits for Converse stream events is a
-   string."
+   string. Parsing stops at the first non-string header, which assumes
+   `:event-type` is never preceded by one (true for Bedrock today)."
   [^bytes b]
   (loop [pos 0
          acc {}]
@@ -200,7 +208,6 @@
                 value-start (+ type-pos 3)]
             (recur (+ value-start value-len)
                    (assoc acc header-name (String. b (int value-start) (int value-len) "UTF-8"))))
-          ;; Unknown header type: stop defensively, we already have what we need.
           acc)))))
 
 (defn ^:private event-stream-seq
@@ -212,19 +219,54 @@
    (when-let [prelude (read-fully is 12)]
      (let [total-len (u32 prelude 0)
            headers-len (u32 prelude 4)
-           payload-len (- total-len headers-len 16)
-           headers (parse-headers (read-fully is headers-len))
-           payload (read-fully is payload-len)
-           _crc (read-fully is 4)
-           event-type (or (get headers ":event-type")
-                          (get headers ":exception-type")
-                          (get headers ":message-type"))
-           data (json/parse-string (String. ^bytes payload "UTF-8") true)]
-       (cons [event-type data] (event-stream-seq is))))))
+           payload-len (- total-len headers-len 16)]
+       (when (neg? payload-len)
+         (throw (ex-info "Malformed Bedrock event-stream frame: negative payload length"
+                         {:total-len total-len :headers-len headers-len})))
+       (let [headers (parse-headers (read-fully is headers-len))
+             payload (read-fully is payload-len)
+             _crc (read-fully is 4)
+             event-type (or (get headers ":event-type")
+                            (get headers ":exception-type")
+                            (get headers ":message-type"))
+             data (json/parse-string (String. ^bytes payload "UTF-8") true)]
+         (cons [event-type data] (event-stream-seq is)))))))
+
+;; --- Non-streaming response parsing ---
+
+(defn ^:private parse-usage [usage]
+  {:input-tokens (or (:inputTokens usage) 0)
+   :output-tokens (or (:outputTokens usage) 0)
+   :input-cache-read-tokens (or (:cacheReadInputTokens usage) 0)
+   :input-cache-creation-tokens (or (:cacheWriteInputTokens usage) 0)})
+
+(def ^:private terminal-stop-reasons #{"end_turn" "tool_use" "stop_sequence"})
+
+(defn ^:private response->result [body on-tools-called-wrapper]
+  (let [content (-> body :output :message :content)
+        stop-reason (:stopReason body)
+        reason-block (some :reasoningContent content)
+        tools-to-call (->> content
+                           (keep :toolUse)
+                           (mapv (fn [{:keys [toolUseId name input]}]
+                                   {:id toolUseId
+                                    :full-name name
+                                    :arguments (or input {})})))]
+    ;; The non-streaming sync path has no :limit-reached channel, so a
+    ;; truncated/filtered response would otherwise look like a clean finish.
+    (when (and stop-reason (not (contains? terminal-stop-reasons stop-reason)))
+      (logger/warn logger-tag (format "Response ended with non-terminal stop reason '%s'" stop-reason)))
+    (assoc-some
+     {:output-text (string/join (keep :text content))
+      :usage (parse-usage (:usage body))}
+     :reason-text (get-in reason-block [:reasoningText :text])
+     :reason-id (when reason-block (str (random-uuid)))
+     :tools-to-call (not-empty tools-to-call)
+     :call-tools-fn (when (seq tools-to-call)
+                      (fn [on-tools-called]
+                        (on-tools-called-wrapper tools-to-call on-tools-called))))))
 
 ;; --- HTTP request (shared by stream / non-stream) ---
-
-(declare ^:private response->result)
 
 (defn ^:private base-request!
   [{:keys [rid body model api-url api-key extra-headers http-client cancelled?
@@ -288,32 +330,110 @@
         (on-error {:exception e :message (llm-util/connection-error-message e)})))
     @response*))
 
-;; --- Non-streaming response ---
+(defn ^:private reissue-after-tools!
+  "Rebuilds the request body from the post-tool-call history and re-issues it
+   via `base-request!`. Shared by the streaming and non-streaming tool loops.
 
-(defn ^:private parse-usage [usage]
-  {:input-tokens (or (:inputTokens usage) 0)
-   :output-tokens (or (:outputTokens usage) 0)
-   :input-cache-read-tokens (or (:cacheReadInputTokens usage) 0)
-   :input-cache-creation-tokens (or (:cacheWriteInputTokens usage) 0)})
+   The tool loop recurses per turn (mirroring `anthropic.clj`); termination
+   relies on the model and the chat layer's subagent step cap rather than a
+   provider-side ceiling."
+  [{:keys [base-opts body supports-image?]}
+   {:keys [new-messages tools fresh-api-key]}
+   extra-opts]
+  (base-request!
+   (merge base-opts
+          {:rid (llm-util/gen-rid)
+           :body (assoc-some (assoc body :messages (normalize-conversation new-messages nil supports-image?))
+                             :toolConfig (->tool-config tools))
+           :api-key (or fresh-api-key (:api-key base-opts))}
+          extra-opts)))
 
-(defn ^:private response->result [body on-tools-called-wrapper]
-  (let [content (-> body :output :message :content)
-        reason-block (some :reasoningContent content)
-        tools-to-call (->> content
-                           (keep :toolUse)
-                           (mapv (fn [{:keys [toolUseId name input]}]
-                                   {:id toolUseId
-                                    :full-name name
-                                    :arguments (or input {})})))]
-    (assoc-some
-     {:output-text (string/join (keep :text content))
-      :usage (parse-usage (:usage body))}
-     :reason-text (get-in reason-block [:reasoningText :text])
-     :reason-id (when reason-block (str (random-uuid)))
-     :tools-to-call (not-empty tools-to-call)
-     :call-tools-fn (when (seq tools-to-call)
-                      (fn [on-tools-called]
-                        (on-tools-called-wrapper tools-to-call on-tools-called))))))
+;; --- Streaming event handler ---
+
+(defn ^:private handle-stream
+  "Drives ECA callbacks from a single ConverseStream event. `ctx` carries the
+   callbacks plus what `reissue-after-tools!` needs to continue the tool loop."
+  [event data content-block*
+   {:keys [on-message-received on-error on-reason on-prepare-tool-call
+           on-tools-called on-usage-updated]
+    :as ctx}]
+  (case event
+    "messageStart" nil
+
+    "contentBlockStart"
+    (when-let [tool-use (-> data :start :toolUse)]
+      (swap! content-block* assoc (:contentBlockIndex data)
+             {:type :tool-use
+              :toolUseId (:toolUseId tool-use)
+              :name (:name tool-use)
+              :input-json ""})
+      (on-prepare-tool-call {:full-name (:name tool-use)
+                             :id (:toolUseId tool-use)
+                             :arguments-text ""}))
+
+    "contentBlockDelta"
+    (let [idx (:contentBlockIndex data)
+          delta (:delta data)]
+      (cond
+        (:text delta)
+        (on-message-received {:type :text :text (:text delta)})
+
+        (:toolUse delta)
+        (let [chunk (-> delta :toolUse :input)]
+          (swap! content-block* update-in [idx :input-json] str chunk)
+          (let [block (get @content-block* idx)]
+            (on-prepare-tool-call {:full-name (:name block)
+                                   :id (:toolUseId block)
+                                   :arguments-text (or chunk "")})))
+
+        (:reasoningContent delta)
+        (let [reasoning (:reasoningContent delta)
+              reason-id (or (get-in @content-block* [idx :reason-id])
+                            (let [new-id (str (random-uuid))]
+                              (swap! content-block* assoc idx {:type :reasoning :reason-id new-id})
+                              (on-reason {:status :started :id new-id})
+                              new-id))]
+          (cond
+            (:text reasoning)
+            (on-reason {:status :thinking :id reason-id :text (:text reasoning)})
+
+            (:signature reasoning)
+            (do (on-reason {:status :finished :id reason-id :external-id (:signature reasoning)})
+                (swap! content-block* assoc-in [idx :signature-done?] true))))))
+
+    "contentBlockStop"
+    (let [block (get @content-block* (:contentBlockIndex data))]
+      (when (and (= :reasoning (:type block))
+                 (not (:signature-done? block)))
+        (on-reason {:status :finished :id (:reason-id block)})))
+
+    "messageStop"
+    (case (:stopReason data)
+      "tool_use"
+      (let [tool-calls (->> (vals @content-block*)
+                            (filter #(= :tool-use (:type %)))
+                            (mapv (fn [{:keys [toolUseId name input-json]}]
+                                    {:id toolUseId
+                                     :full-name name
+                                     :arguments (json/parse-string input-json)})))]
+        (when-let [tools-result (on-tools-called tool-calls)]
+          (reissue-after-tools! ctx tools-result
+                                {:content-block* (atom {})
+                                 :on-error on-error
+                                 :on-stream (fn [e d cb] (handle-stream e d cb ctx))})))
+
+      "max_tokens"
+      (on-message-received {:type :limit-reached})
+
+      ;; "end_turn" / "stop_sequence" / "content_filtered" / "guardrail_intervened"
+      (on-message-received {:type :finish :finish-reason (:stopReason data)}))
+
+    "metadata"
+    (when-let [usage (:usage data)]
+      (on-usage-updated (parse-usage usage)))
+
+    ;; exception / error frames
+    (on-error {:message (format "Bedrock stream error (%s): %s" event data)})))
 
 ;; --- Entry point ---
 
@@ -321,12 +441,10 @@
   [{:keys [model user-messages instructions max-output-tokens api-url api-key
            reason? past-messages tools extra-payload extra-headers supports-image?
            http-client cancelled?]}
-   {:keys [on-message-received on-error on-reason on-prepare-tool-call
-           on-tools-called on-usage-updated] :as callbacks}]
+   {:keys [on-error] :as callbacks}]
   (let [stream? (boolean callbacks)
         cancelled? (or cancelled? (constantly false))
-        messages (normalize-conversation past-messages user-messages supports-image?)
-        body (build-body {:messages messages
+        body (build-body {:messages (normalize-conversation past-messages user-messages supports-image?)
                           :instructions instructions
                           :max-output-tokens max-output-tokens
                           :tools tools
@@ -334,110 +452,25 @@
                           :extra-payload extra-payload})
         base-opts {:model model
                    :api-url api-url
+                   :api-key api-key
                    :extra-headers extra-headers
                    :http-client http-client
                    :cancelled? cancelled?}
-        ;; Re-issue the request after tools ran, rebuilding messages from the
-        ;; updated history the chat pipeline hands back.
+        reissue-ctx {:base-opts base-opts :body body :supports-image? supports-image?}
+        ;; Non-streaming tool loop: re-issue with the updated history, which
+        ;; yields another result map the sync caller drives.
         on-tools-called-wrapper
         (fn on-tools-called-wrapper [tools-to-call on-tools-called]
-          (when-let [{:keys [new-messages tools fresh-api-key]} (on-tools-called tools-to-call)]
-            (let [messages (normalize-conversation new-messages nil supports-image?)]
-              (base-request! (merge base-opts
-                                    {:rid (llm-util/gen-rid)
-                                     :body (assoc-some (assoc body :messages messages)
-                                                       :toolConfig (->tool-config tools))
-                                     :api-key (or fresh-api-key api-key)
-                                     :on-tools-called-wrapper on-tools-called-wrapper})))))
-        handle-stream
-        (when stream?
-          (fn handle-stream [event data content-block*]
-            (case event
-              "messageStart" nil
-
-              "contentBlockStart"
-              (when-let [tool-use (-> data :start :toolUse)]
-                (swap! content-block* assoc (:contentBlockIndex data)
-                       {:type :tool-use
-                        :toolUseId (:toolUseId tool-use)
-                        :name (:name tool-use)
-                        :input-json ""})
-                (on-prepare-tool-call {:full-name (:name tool-use)
-                                       :id (:toolUseId tool-use)
-                                       :arguments-text ""}))
-
-              "contentBlockDelta"
-              (let [idx (:contentBlockIndex data)
-                    delta (:delta data)]
-                (cond
-                  (:text delta)
-                  (on-message-received {:type :text :text (:text delta)})
-
-                  (:toolUse delta)
-                  (let [chunk (-> delta :toolUse :input)]
-                    (swap! content-block* update-in [idx :input-json] str chunk)
-                    (let [block (get @content-block* idx)]
-                      (on-prepare-tool-call {:full-name (:name block)
-                                             :id (:toolUseId block)
-                                             :arguments-text (or chunk "")})))
-
-                  (:reasoningContent delta)
-                  (let [reasoning (:reasoningContent delta)
-                        reason-id (or (get-in @content-block* [idx :reason-id])
-                                      (let [new-id (str (random-uuid))]
-                                        (swap! content-block* assoc idx {:type :reasoning :reason-id new-id})
-                                        (on-reason {:status :started :id new-id})
-                                        new-id))]
-                    (cond
-                      (:text reasoning)
-                      (on-reason {:status :thinking :id reason-id :text (:text reasoning)})
-
-                      (:signature reasoning)
-                      (do (on-reason {:status :finished :id reason-id :external-id (:signature reasoning)})
-                          (swap! content-block* assoc-in [idx :signature-done?] true))))))
-
-              "contentBlockStop"
-              (let [block (get @content-block* (:contentBlockIndex data))]
-                (when (and (= :reasoning (:type block))
-                           (not (:signature-done? block)))
-                  (on-reason {:status :finished :id (:reason-id block)})))
-
-              "messageStop"
-              (case (:stopReason data)
-                "tool_use"
-                (let [tool-calls (->> (vals @content-block*)
-                                      (filter #(= :tool-use (:type %)))
-                                      (mapv (fn [{:keys [toolUseId name input-json]}]
-                                              {:id toolUseId
-                                               :full-name name
-                                               :arguments (json/parse-string input-json)})))]
-                  (when-let [{:keys [new-messages tools fresh-api-key]} (on-tools-called tool-calls)]
-                    (base-request! (merge base-opts
-                                          {:rid (llm-util/gen-rid)
-                                           :body (assoc-some (assoc body :messages (normalize-conversation new-messages nil supports-image?))
-                                                             :toolConfig (->tool-config tools))
-                                           :api-key (or fresh-api-key api-key)
-                                           :content-block* (atom {})
-                                           :on-error on-error
-                                           :on-stream handle-stream}))))
-
-                "max_tokens"
-                (on-message-received {:type :limit-reached})
-
-                ;; "end_turn" / "stop_sequence" / "content_filtered" / "guardrail_intervened"
-                (on-message-received {:type :finish :finish-reason (:stopReason data)}))
-
-              "metadata"
-              (when-let [usage (:usage data)]
-                (on-usage-updated (parse-usage usage)))
-
-              ;; exception / error frames
-              (on-error {:message (format "Bedrock stream error (%s): %s" event data)}))))]
+          (when-let [tools-result (on-tools-called tools-to-call)]
+            (reissue-after-tools! reissue-ctx tools-result
+                                  {:on-tools-called-wrapper on-tools-called-wrapper})))
+        stream-ctx (merge callbacks reissue-ctx)]
     (base-request! (merge base-opts
                           {:rid (llm-util/gen-rid)
                            :body body
-                           :api-key api-key
                            :content-block* (atom {})
                            :on-error (or on-error identity)
                            :on-tools-called-wrapper on-tools-called-wrapper
-                           :on-stream handle-stream}))))
+                           :on-stream (when stream?
+                                        (fn [event data content-block*]
+                                          (handle-stream event data content-block* stream-ctx)))}))))
